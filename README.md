@@ -1,6 +1,6 @@
 # OPF Pipeline Context — PicPay
 
-Repositório de contexto do pipeline **OPF (Open Finance)** para incentivo à portabilidade de saldo/salário via consentimentos.
+Repositório de contexto do pipeline **OPF (Open Finance)** para incentivo ao consentimento da conta.
 
 > 💡 **Como usar com o GitHub Copilot CLI:**
 > No início de cada sessão diga:
