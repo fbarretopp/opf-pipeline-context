@@ -12,7 +12,6 @@
 |------|-----------|------|--------|
 | Régua de OPF Bancos v5 | `2964021027635636` | [abrir](https://picpay-principal.cloud.databricks.com/editor/notebooks/2964021027635636) | Base histórica |
 | Régua de OPF Bancos v6 | `2964021027643933` | [abrir](https://picpay-principal.cloud.databricks.com/editor/notebooks/2964021027643933) | ✅ Produção |
-| Régua de OPF Bancos v7 | `1328412056909775` | [abrir](https://picpay-principal.cloud.databricks.com/editor/notebooks/1328412056909775) | ✅ Publicado |
 | Acompanhamento v1 | `2964021027667167` | [abrir](https://picpay-principal.cloud.databricks.com/editor/notebooks/2964021027667167) | ✅ Monitoramento |
 | Validação OPF (referência) | `1500094211290451` | [abrir](https://picpay-principal.cloud.databricks.com/editor/notebooks/1500094211290451) | Referência |
 
@@ -26,12 +25,12 @@ Pipeline principal de geração diária da base de comunicação.
 - Gera a tabela `validation.pp_users_growth_opf` (particionada por `updated_date`)
 - Prioriza NOVOS (cap 800k), depois completa com LEGADO até 800k total
 
-### v7 — Régua de OPF Bancos v7
-Evolução operacional da régua principal.
-- Mantém a lógica de seleção da v6
+### v7 — Regua_de_OPF_Bancos_v7.py (GitHub only)
+Versão em SOURCE derivada do notebook de produção `2964021027643933`.
+- Mantém a lógica da v6 como base
 - Adiciona trava de frescor da fonte `validation.pp_users_growth_opf_communication`
-- Só permite gravação quando `max(last_transaction) >= d-1`
-- Aborta a execução sem gravar partição quando a fonte estiver vazia ou desatualizada
+- Encerra a execução com `dbutils.notebook.exit(...)` quando `max(last_transaction) < d-1`
+- Referência de contexto: comando `6383714641200101` do notebook de produção
 
 ### Acompanhamento v1
 Notebook interativo de monitoramento com 8 seções e widgets:
