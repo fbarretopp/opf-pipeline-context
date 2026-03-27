@@ -13,8 +13,14 @@
 # MAGIC (detectada via Open Finance) e o seleciona para receber comunicação.
 # MAGIC
 # MAGIC **v8 — Novidade:** campo `group` na saída para separação de experimento GC/GT.
-# MAGIC - **Primeira execução:** 10% das chaves selecionadas (aleatoriamente) → `GC`; 90% → `GT`
-# MAGIC - **Execuções seguintes:** usuários com grupo histórico mantêm seu grupo; novos usuários recebem atribuição aleatória (10% `GC`, 90% `GT`). Um `GC` jamais é reclassificado como `GT`.
+# MAGIC - **GC (Grupo Controle, ~10%):** usuários excluídos permanentemente da seleção diária —
+# MAGIC   aparecem na tabela apenas no dia em que foram sorteados; nunca mais retornam ao pool.
+# MAGIC - **GT (Grupo Teste, ~90%):** usuários selecionados normalmente para comunicação.
+# MAGIC - **Primeira execução:** dos 800k selecionados, ~10% recebem `GC` e ~90% recebem `GT`
+# MAGIC   via hash determinístico sobre `user_id`.
+# MAGIC - **Execuções seguintes:** usuários já marcados como `GC` são **excluídos no Passo 4**
+# MAGIC   (antes da seleção dos 800k), nunca competindo por slots. Os demais recebem atribuição
+# MAGIC   via hash — idempotente e sem necessidade de join com histórico.
 # MAGIC
 # MAGIC ## Fontes e saída
 # MAGIC | Tabela | Papel | Descrição |
@@ -39,18 +45,22 @@
 # MAGIC Tabela SS (fonte)
 # MAGIC     ↓  join MAU + normalização de banco
 # MAGIC Base MAU Elegível (melhor banco por user_id)
+# MAGIC     ↓  Passo 4 — Exclusões
+# MAGIC         - Cooldown de usuário (3d)
+# MAGIC         - Bloqueio de chave (15d)
+# MAGIC         - Blacklist de usuário (3x/30d → 30d)
+# MAGIC         - ⭐ Holdout GC: remove usuários já marcados GC no histórico ← (v8)
 # MAGIC     ↓  split por data de entrada
 # MAGIC ┌─────────────────────┐    ┌──────────────────────────────────────────┐
 # MAGIC │ NOVOS               │    │ LEGADO ELEGÍVEL                          │
-# MAGIC │ (desde última run)  │    │ - Remove cooldown de usuário (N dias)    │
-# MAGIC │ Todos entram        │    │ - Remove blacklist de chave              │
-# MAGIC │ até 800k.           │    │   (≥ X comms em Y dias → bloqueada Z dias)│
-# MAGIC └──────────┬──────────┘    │ - Ordena: last_tx DESC → prio banco      │
-# MAGIC            │               │ - Limit: slots restantes após NOVOS      │
-# MAGIC            │               └──────────────────┬───────────────────────┘
+# MAGIC │ (desde última run)  │    │ - Ordena: last_tx DESC → prio banco      │
+# MAGIC │ Todos entram        │    │ - Limit: slots restantes após NOVOS      │
+# MAGIC │ até 800k.           │    │                                          │
+# MAGIC └──────────┬──────────┘    └──────────────────┬───────────────────────┘
 # MAGIC            └──────────────────────────────────┘
-# MAGIC                               ↓  union
-# MAGIC                    Atribuição de grupo GC/GT
+# MAGIC                               ↓  union (800k, todos não-GC)
+# MAGIC               Passo 7.5 — Atribuição GC/GT via hash(user_id)
+# MAGIC               ~10% → GC (holdout), ~90% → GT (comunicados)
 # MAGIC                               ↓
 # MAGIC                    Write → validation.pp_users_growth_opf
 # MAGIC ```
@@ -357,7 +367,7 @@ print(f"✅ Base MAU elegível: {cnt_priorizado:,} registros (1 por user_id)")
 # MAGIC %md
 # MAGIC # 4. Regras de Exclusão
 # MAGIC ---
-# MAGIC > Três listas de bloqueio são calculadas **antes** de classificar NOVO vs LEGADO:
+# MAGIC > Quatro listas de bloqueio são calculadas **antes** de classificar NOVO vs LEGADO:
 # MAGIC >
 # MAGIC > | Regra | Quem bloqueia | Parâmetro |
 # MAGIC > |-------|---------------|-----------|
@@ -365,6 +375,7 @@ print(f"✅ Base MAU elegível: {cnt_priorizado:,} registros (1 por user_id)")
 # MAGIC > | **Cooldown de usuário** | Usuário comunicado nos últimos `JANELA_COOLDOWN_USUARIO_DIAS` (3) dias | `JANELA_COOLDOWN_USUARIO_DIAS` |
 # MAGIC > | **Bloqueio de chave** *(v6)* | Chave comunicada nos últimos `JANELA_BLOQUEIO_CHAVE_DIAS` (15) dias | `JANELA_BLOQUEIO_CHAVE_DIAS` |
 # MAGIC > | **Blacklist de usuário** *(v6)* | Usuário com ≥ `LIMITE_COMUNICACOES_USUARIO` (3) comms em 30d → bloqueado por `JANELA_BLOQUEIO_USUARIO_DIAS` (30d) | `JANELA_BLOQUEIO_USUARIO_DIAS` |
+# MAGIC > | **⭐ Holdout GC** *(v8)* | Usuário já marcado como `GC` em qualquer run anterior — excluído **permanentemente** do pool de seleção | — |
 
 # COMMAND ----------
 
@@ -471,6 +482,41 @@ except AnalysisException:
 # COMMAND ----------
 
 # MAGIC %md
+# MAGIC ## 4.4 — Holdout GC Histórico (v8)
+# MAGIC > **Regra:** Qualquer usuário que já foi marcado como `GC` em qualquer run anterior é
+# MAGIC > excluído **permanentemente** do pool de seleção. Eles nunca mais competem por slots.
+# MAGIC >
+# MAGIC > Isso garante a integridade do experimento: o grupo controle é um holdout puro e
+# MAGIC > a seleção dos 800k diários não é "contaminada" por usuários que nunca serão comunicados.
+# MAGIC >
+# MAGIC > **Fallback:** Se a tabela não existir, ou se a coluna `group` ainda não existir
+# MAGIC > (primeiras runs com v8 sobre tabela criada por v6/v7), a view fica vazia —
+# MAGIC > todos os usuários são elegíveis para receber a atribuição inicial.
+
+# COMMAND ----------
+
+try:
+    df_gc_historico = spark.sql(f"""
+        SELECT DISTINCT user_id
+        FROM {TABELA_HISTORICO}
+        WHERE `group` = 'GC'
+          AND updated_date < '{DATA_HOJE}'
+    """)
+    df_gc_historico.persist(StorageLevel.MEMORY_AND_DISK)
+    cnt_gc_historico = df_gc_historico.count()
+    df_gc_historico.createOrReplaceTempView("gc_historico")
+    if cnt_gc_historico > 0:
+        print(f"🧪 Holdout GC: {cnt_gc_historico:,} usuários excluídos permanentemente do pool")
+    else:
+        print("ℹ️  Sem holdout GC no histórico — primeira atribuição de grupos (todos elegíveis)")
+except AnalysisException:
+    spark.sql("CREATE OR REPLACE TEMP VIEW gc_historico AS SELECT CAST(0L AS BIGINT) AS user_id WHERE 1=0")
+    cnt_gc_historico = 0
+    print("ℹ️  Tabela/coluna 'group' ausente — nenhum usuário em holdout GC (primeira execução v8)")
+
+# COMMAND ----------
+
+# MAGIC %md
 # MAGIC # 5. Classificação NOVO vs LEGADO
 # MAGIC ---
 # MAGIC > A base priorizada (1 linha por user_id) é dividida em dois grupos:
@@ -505,6 +551,8 @@ df_novos_pool = spark.sql(f"""
           WHERE bc.user_id = f.user_id AND bc.bank_name = f.bank_name
       )
       AND NOT EXISTS (SELECT 1 FROM blacklist_usuario bu WHERE bu.user_id = f.user_id)
+      -- Exclui holdout GC — usuários que já foram grupo controle nunca mais entram no pool (v8)
+      AND NOT EXISTS (SELECT 1 FROM gc_historico gc WHERE gc.user_id = f.user_id)
 """)
 
 df_novos_pool.persist(StorageLevel.MEMORY_AND_DISK)
@@ -600,6 +648,8 @@ df_legado_elegivel = spark.sql(f"""
       )
       AND NOT EXISTS (SELECT 1 FROM blacklist_usuario bu WHERE bu.user_id = f.user_id)
       AND NOT EXISTS (SELECT 1 FROM novos_dia nd WHERE nd.user_id = f.user_id)
+      -- Exclui holdout GC — usuários que já foram grupo controle nunca mais entram no pool (v8)
+      AND NOT EXISTS (SELECT 1 FROM gc_historico gc WHERE gc.user_id = f.user_id)
 """)
 
 df_legado_elegivel.persist(StorageLevel.MEMORY_AND_DISK)
@@ -612,6 +662,7 @@ try:
     df_cooldown_usuario.unpersist()
     df_bloqueio_chave.unpersist()
     df_blacklist_usuario.unpersist()
+    df_gc_historico.unpersist()
 except:
     pass
 print("🔓 Caches intermediários liberados")
@@ -734,93 +785,43 @@ print(f"   LEGADO : {qtd_legado_selecionado:,} ({100 * qtd_legado_selecionado / 
 # MAGIC %md
 # MAGIC ## 7.5 — Atribuição de Grupo GC / GT (v8)
 # MAGIC ---
-# MAGIC > **Regras:**
-# MAGIC > - Usuários com grupo registrado no histórico mantêm seu grupo (`GC` jamais vira `GT`).
-# MAGIC > - Usuários sem histórico de grupo recebem atribuição determinística baseada em `user_id`:
-# MAGIC >   `abs(hash(user_id)) % 100 < 10` → `GC`; demais → `GT`.
+# MAGIC > **Por que aqui e não na Seção 4?**
+# MAGIC > A Seção 4.4 excluiu os **já-GC** do pool *antes* da seleção. O que chegou aqui são
+# MAGIC > somente usuários elegíveis (nunca foram GC). A atribuição do grupo acontece agora,
+# MAGIC > depois que os 800k foram definidos, para não desperdiçar slots na seleção.
 # MAGIC >
-# MAGIC > A atribuição via hash é **determinística por user_id** e **idempotente** —
-# MAGIC > rodar o notebook duas vezes no mesmo dia produz exatamente o mesmo resultado.
+# MAGIC > **Método:** hash determinístico sobre `user_id` — idempotente (re-run = mesmo resultado),
+# MAGIC > sem join com histórico (desnecessário pois GC já foi removido na Seção 4.4).
 # MAGIC >
-# MAGIC > **Proporção esperada para novos usuários:** ~10% GC / ~90% GT.
-# MAGIC >
-# MAGIC > | Situação | Grupo atribuído |
-# MAGIC > |----------|-----------------|
-# MAGIC > | Usuário já apareceu com `group = 'GC'` no histórico | `GC` (mantido) |
-# MAGIC > | Usuário já apareceu com `group = 'GT'` no histórico | `GT` (mantido) |
-# MAGIC > | Usuário nunca visto antes (sem histórico de grupo) | `GC` (≈10%) ou `GT` (≈90%) via hash |
+# MAGIC > | Condição | Grupo |
+# MAGIC > |----------|-------|
+# MAGIC > | `abs(hash(user_id)) % 100 < 10` | `GC` — entra no holdout hoje, excluído de amanhã em diante |
+# MAGIC > | caso contrário | `GT` — comunicado normalmente |
 
 # COMMAND ----------
 
-# Tenta carregar grupos históricos (pode falhar se a tabela não existe ou não tem coluna 'group')
-_historico_grupos_existe_ = False
-try:
-    df_historico_grupos = spark.sql(f"""
-        SELECT DISTINCT user_id, `group`
-        FROM {TABELA_HISTORICO}
-        WHERE `group` IS NOT NULL
-          AND updated_date < '{DATA_HOJE}'
-    """)
-    df_historico_grupos.persist(StorageLevel.MEMORY_AND_DISK)
-    cnt_historico_grupos = df_historico_grupos.count()
-
-    if cnt_historico_grupos > 0:
-        _historico_grupos_existe_ = True
-        print(f"📚 Histórico de grupos encontrado: {cnt_historico_grupos:,} usuários com grupo atribuído")
-    else:
-        df_historico_grupos.unpersist()
-        print("ℹ️  Coluna 'group' existe mas sem registros anteriores — atribuição inicial")
-
-except AnalysisException:
-    print("ℹ️  Sem histórico de grupos (tabela inexistente ou coluna 'group' ausente) — primeira atribuição")
-
-# COMMAND ----------
-
-# Expressão de atribuição para usuários SEM histórico de grupo:
-# Determinístico por user_id — ~10% recebe GC, ~90% recebe GT
-_expr_novo_grupo_ = when(
+# Todos os usuários aqui são não-GC (garantido pela exclusão na Seção 4.4).
+# A atribuição via hash é determinística por user_id e não requer join com histórico.
+_expr_grupo_ = when(
     (spark_abs(spark_hash("user_id")) % 100) < int(PCT_GC * 100),
     lit("GC")
 ).otherwise(lit("GT"))
 
-if not _historico_grupos_existe_:
-    # Primeira execução (ou sem histórico válido): atribui grupo a todos via hash
-    _output_df_final_ = (
-        _output_df_
-        .withColumn("group", _expr_novo_grupo_)
-        .select("user_id", "bank_name", "entry_date", "last_transaction_date",
-                "type", "group", "updated_date")
-        .repartition(200)
-    )
-    print(f"🎲 Atribuição inicial: hash(user_id) % 100 < {int(PCT_GC * 100)} → GC | demais → GT")
+_output_df_final_ = (
+    _output_df_
+    .withColumn("group", _expr_grupo_)
+    .select("user_id", "bank_name", "entry_date", "last_transaction_date",
+            "type", "group", "updated_date")
+    .repartition(200)
+)
 
-else:
-    # Execuções seguintes:
-    # 1. Join com histórico para recuperar grupos já atribuídos
-    # 2. Para usuários sem histórico: aplica hash-based assignment
-    _output_df_final_ = (
-        _output_df_
-        .join(df_historico_grupos, on="user_id", how="left")
-        .withColumn(
-            "group",
-            when(col("group").isNotNull(), col("group"))  # mantém grupo histórico
-            .otherwise(_expr_novo_grupo_)                  # novos: hash-based
-        )
-        .select("user_id", "bank_name", "entry_date", "last_transaction_date",
-                "type", "group", "updated_date")
-        .repartition(200)
-    )
-    df_historico_grupos.unpersist()
-    print(f"🔒 Grupos históricos preservados; novos usuários recebem hash-based assignment")
-
-# Contagens por grupo para logging
 _cnt_gc_ = _output_df_final_.filter(col("group") == "GC").count()
 _cnt_gt_ = _output_df_final_.filter(col("group") == "GT").count()
 _pct_gc_ = 100 * _cnt_gc_ / qtd_total if qtd_total > 0 else 0
-print(f"\n📊 Distribuição de grupos:")
-print(f"   GC : {_cnt_gc_:,} ({_pct_gc_:.1f}%)")
-print(f"   GT : {_cnt_gt_:,} ({100 - _pct_gc_:.1f}%)")
-print(f"   Total: {qtd_total:,}")
+print(f"📊 Distribuição de grupos (hash determinístico, PCT_GC={PCT_GC}):")
+print(f"   GC (holdout) : {_cnt_gc_:,} ({_pct_gc_:.1f}%)  → excluídos do pool a partir de amanhã")
+print(f"   GT (teste)   : {_cnt_gt_:,} ({100 - _pct_gc_:.1f}%)  → receberão comunicação")
+print(f"   Total        : {qtd_total:,}")
 
 # COMMAND ----------
 
@@ -1100,8 +1101,8 @@ spark.sql(f"""
 # MAGIC ## 9.8 — Validação de Grupos GC/GT (v8)
 # MAGIC ---
 # MAGIC > Garante que:
-# MAGIC > 1. Nenhum usuário histórico `GC` foi reclassificado como `GT` hoje
-# MAGIC > 2. A distribuição GC/GT está próxima do alvo (10%/90%)
+# MAGIC > 1. Nenhum usuário histórico `GC` voltou a ser selecionado hoje (violação do holdout)
+# MAGIC > 2. A distribuição GC/GT está próxima do alvo (~10%/~90%)
 
 # COMMAND ----------
 
@@ -1123,12 +1124,12 @@ spark.sql(f"""
 
 # COMMAND ----------
 
-# Verificação crítica: nenhum GC histórico deve aparecer como GT hoje
-violacoes_grupo = spark.sql(f"""
+# Verificação crítica: nenhum GC histórico deve aparecer na seleção de hoje
+# (a Seção 4.4 deveria ter bloqueado; esta query detecta falhas de idempotência)
+violacoes_holdout = spark.sql(f"""
     SELECT COUNT(*) AS violacoes
     FROM {TABELA_HISTORICO} hoje
     WHERE hoje.updated_date = '{DATA_HOJE}'
-      AND hoje.`group` = 'GT'
       AND EXISTS (
           SELECT 1
           FROM {TABELA_HISTORICO} hist
@@ -1138,20 +1139,21 @@ violacoes_grupo = spark.sql(f"""
       )
 """).first()["violacoes"]
 
-if violacoes_grupo > 0:
-    print(f"🚨 ATENÇÃO CRÍTICA: {violacoes_grupo:,} usuários que eram GC foram marcados como GT hoje!")
+if violacoes_holdout > 0:
+    print(f"🚨 VIOLAÇÃO DE HOLDOUT: {violacoes_holdout:,} usuários que eram GC foram selecionados hoje!")
+    print("   Isso indica falha na exclusão da Seção 4.4 — investigar imediatamente.")
     spark.sql(f"""
-        SELECT hoje.user_id, hoje.`group` AS grupo_hoje, hist.`group` AS grupo_historico, hist.updated_date
+        SELECT hoje.user_id, hoje.`group` AS grupo_hoje,
+               hist.updated_date AS data_gc_historico
         FROM {TABELA_HISTORICO} hoje
         INNER JOIN {TABELA_HISTORICO} hist ON hoje.user_id = hist.user_id
         WHERE hoje.updated_date = '{DATA_HOJE}'
-          AND hoje.`group` = 'GT'
           AND hist.`group` = 'GC'
           AND hist.updated_date < '{DATA_HOJE}'
         LIMIT 20
     """).display()
 else:
-    print("✅ Integridade de grupos validada — nenhum GC foi reclassificado como GT")
+    print("✅ Holdout GC íntegro — nenhum usuário GC histórico foi selecionado hoje")
 
 # COMMAND ----------
 
