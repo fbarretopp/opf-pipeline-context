@@ -22,6 +22,16 @@ databricks auth token --profile picpay-datalake
 
 ---
 
+## Deploy via Airflow
+
+- **Repo:** `picpay-ss-airflow`
+- **Schedule:** `0 14 * * *` (diário, 14h UTC)
+- **YAML de metadados:** `artifacts/self_service_analytics/pf_growth_users_opf_journey_communication/`
+- **Domain (gov-metastore):** `consumers`
+- **Partição:** `segmentation_date`
+
+---
+
 ## Plotly em Databricks — boas práticas
 
 ### Exibir gráfico inline
@@ -31,7 +41,6 @@ displayHTML(fig.to_html(include_plotlyjs="cdn", full_html=False))
 
 ### Evitar "multiple values for keyword argument"
 ```python
-# LAY_BASE deve conter APENAS chaves que nunca são passadas como kwargs diretos
 LAY_BASE = dict(
     paper_bgcolor="#FFFFFF",
     plot_bgcolor="#FFFFFF",
@@ -47,7 +56,7 @@ def apply_layout(fig, h=420, **kwargs):
     displayHTML(fig.to_html(include_plotlyjs="cdn", full_html=False))
 ```
 
-> ⚠️ `go.Waterfall` não suporta `marker=` em versões antigas do Plotly no Databricks.
+> `go.Waterfall` não suporta `marker=` em versões antigas do Plotly no Databricks.
 > Use `go.Bar` com `base=` como alternativa.
 
 ### Widgets interativos
@@ -57,18 +66,6 @@ dbutils.widgets.text("data_fim", "2025-01-01", "Data Fim")
 dbutils.widgets.dropdown("tipo", "TODOS", ["TODOS","NOVO","LEGADO"], "Tipo")
 
 valor = dbutils.widgets.get("data_fim")
-```
-
----
-
-## Pandas / Spark
-
-```python
-# Converter coluna de data para string (evita erros de tipo)
-df["data"] = df["data"].astype(str)
-
-# Números brasileiros no CSV (ponto como separador de milhar)
-df[col] = df[col].astype(str).str.replace(".", "", regex=False).astype(float)
 ```
 
 ---
@@ -91,7 +88,7 @@ payload = {
     "format":    "SOURCE",
     "language":  "PYTHON",
     "content":   b64,
-    "overwrite": True   # False para criar novo sem sobrescrever
+    "overwrite": True
 }
 
 subprocess.run([
@@ -103,5 +100,5 @@ subprocess.run([
 ])
 ```
 
-> ⚠️ Caminhos com caracteres UTF-8 (é, ã) devem ser unicode-escaped no JSON:
+> Caminhos com caracteres UTF-8 (é, ã) devem ser unicode-escaped no JSON:
 > `"R\u00e9gua"` em vez de `"Régua"`

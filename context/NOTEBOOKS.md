@@ -1,66 +1,55 @@
 # Notebooks Databricks — OPF Pipeline
 
-**Workspace:** `https://picpay-principal.cloud.databricks.com`  
-**Profile local:** `picpay-datalake` (em `~/.databrickscfg`)  
+**Workspace:** `https://picpay-principal.cloud.databricks.com`
+**Profile local:** `picpay-datalake` (em `~/.databrickscfg`)
 **Pasta:** `/Users/felipe.gbarreto@picpay.com/regua_if_opf/`
 
 ---
 
-## Notebooks Ativos
+## Notebook de Produção
 
 | Nome | Object ID | Link | Status |
 |------|-----------|------|--------|
-| Régua de OPF Bancos v5 | `2964021027635636` | [abrir](https://picpay-principal.cloud.databricks.com/editor/notebooks/2964021027635636) | Base histórica |
-| Régua de OPF Bancos v6 | `2964021027643933` | [abrir](https://picpay-principal.cloud.databricks.com/editor/notebooks/2964021027643933) | ✅ Produção |
-| Acompanhamento v1 | `2964021027667167` | [abrir](https://picpay-principal.cloud.databricks.com/editor/notebooks/2964021027667167) | ✅ Monitoramento |
-| Validação OPF (referência) | `1500094211290451` | [abrir](https://picpay-principal.cloud.databricks.com/editor/notebooks/1500094211290451) | Referência |
+| Régua de OPF | `1328412056932520` | [abrir](https://picpay-principal.cloud.databricks.com/editor/notebooks/1328412056932520) | **Produção** |
 
 ---
 
-## O que cada notebook faz
+## O que o notebook faz
 
-### v6 — Régua de OPF Bancos v6
-Pipeline principal de geração diária da base de comunicação.
-- Aplica filtros MAU, cooldown, bloqueio de chave e blacklist de usuário
-- Gera a tabela `validation.pp_users_growth_opf` (particionada por `updated_date`)
-- Prioriza NOVOS (cap 800k), depois completa com LEGADO até 800k total
+Pipeline principal de geração diária da base de comunicação OPF.
 
-### v7 — Regua_de_OPF_Bancos_v7.py (GitHub only)
-Versão em SOURCE derivada do notebook de produção `2964021027643933`.
-- Mantém a lógica da v6 como base
-- Adiciona trava de frescor da fonte `validation.pp_users_growth_opf_communication`
-- Encerra a execução com `dbutils.notebook.exit(...)` quando `max(last_transaction) < d-1`
-- Referência de contexto: comando `6383714641200101` do notebook de produção
-
-### Acompanhamento v1
-Notebook interativo de monitoramento com 8 seções e widgets:
-- **Widgets:** `data_fim`, `n_dias`, `data_hoje`, `tipo` (TODOS/NOVO/LEGADO), `banco_filter`, `top_n_bancos`
-- **Seção 1:** Funil de criação (volume por filtro)
-- **Seção 2:** Histórico recente NOVOS vs LEGADO
-- **Seção 3:** Distribuição por banco (ranking, Pareto, composição %)
-- **Seção 4:** Recência das chaves por faixa de meses
-- **Seção 5:** Monitoramento de bloqueios (cooldown + chaves bloqueadas)
-- **Seção 6:** Pivot Dia × Banco (heatmap)
-- **Seção 7:** Tendências semanais WoW
-- **Seção 8:** KPIs de qualidade (duplicatas, cobertura)
+1. Valida frescor da fonte (encerra se `most_recent_transaction_at < d-1`)
+2. Filtra usuários MAU com contas detectadas via Open Finance (`is_opf_account_active = false`, `is_in_opf_list = true`)
+3. Seleciona o melhor banco por user_id (ROW_NUMBER por prioridade)
+4. Aplica filtros: cooldown (3d), bloqueio de chave (15d), blacklist de usuário (3x/30d → 30d), holdout GC
+5. Prioriza NOVOS (cap 800k via Bank-Bucket-Drain), completa com LEGADO (Day-Bucket-Drain)
+6. Atribui `experiment_group` via hash determinístico (GC ~10% / GT ~90%)
+7. Escreve em `self_service_analytics.pf_growth_users_opf_journey_communication` (partição dinâmica por `segmentation_date`)
+8. Executa validações pós-write (duplicatas, cooldown, blacklist, holdout GC)
 
 ---
 
-## Autenticação Databricks
+## Notebooks históricos (referência)
 
-```bash
-# Verificar token
-databricks auth token --profile picpay-datalake
+| Nome | Object ID | Descrição |
+|------|-----------|-----------|
+| Régua de OPF Bancos v6 | `2964021027643933` | Produção anterior (sem experiment_group) |
+| Régua de OPF Bancos v5 | `2964021027635636` | Base histórica |
+| Acompanhamento v1 | `2964021027667167` | Monitoramento |
+| Validação OPF | `1500094211290451` | Referência |
 
-# Reautenticar (token expira ~1h)
-databricks auth login --profile picpay-datalake
+---
 
-# Upload de notebook
-curl -sf -X POST \
-  -H "Authorization: Bearer $TOKEN" \
-  -H "Content-Type: application/json" \
-  https://picpay-principal.cloud.databricks.com/api/2.0/workspace/import \
-  -d '{"path":"...","format":"SOURCE","language":"PYTHON","content":"<base64>","overwrite":true}'
-```
+## Outros notebooks na pasta
 
-> ⚠️ A chave no JSON de retorno é `access_token` (não `token_value`)
+| Nome | Object ID | Descrição |
+|------|-----------|-----------|
+| ajuste_ss_users_opf | `665942654981934` | Ajustes na tabela fonte SS |
+
+---
+
+## Deploy
+
+O notebook roda via **Airflow** no repo `picpay-ss-airflow`.
+- Schedule: `0 14 * * *` (diário, 14h UTC)
+- YAML de metadados: `artifacts/self_service_analytics/pf_growth_users_opf_journey_communication/`
